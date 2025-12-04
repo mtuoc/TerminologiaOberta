@@ -73,19 +73,26 @@ def passes_filters(category, denomination_type, denomination_jerarquia,
 
 
 # ==============================================================================
-# 2. MAIN CONVERSION LOGIC
+# 2. MAIN CONVERSION LOGIC (MODIFIED for Multilingual List)
 # ==============================================================================
 
-def xml_to_tbx(input_file, output_file, sl, tl, 
-               include_area, include_definition, include_category, 
-               category_starts, type_filter, hierarchy_filter):
+def xml_to_tbx(input_file, output_file, languages, 
+                include_area, include_definition, include_category, 
+                category_starts, type_filter, hierarchy_filter):
     """
     Converts an XML glossary file into a TermBase eXchange (TBX) file,
-    with optional filtering and inclusion of various data fields.
+    including terms only for the specified list of languages.
     """
     print(f"Starting XML to TBX conversion for {input_file}...")
     
-    # --- 1. TBX Structure Setup ---
+    # 1. Normalize Languages List
+    # The 'languages' variable comes from argparse as a list of strings
+    normalized_languages = normalize_filter_list(languages)
+    if not normalized_languages:
+        print("Error: The language list is empty or invalid.", file=sys.stderr)
+        return
+
+    # --- 2. TBX Structure Setup ---
     NS_TBX = "urn:iso:std:iso:61440:TBX-core" 
     NS_XML = "http://www.w3.org/XML/1998/namespace"
     
@@ -105,7 +112,7 @@ def xml_to_tbx(input_file, output_file, sl, tl,
     text = ET.SubElement(martif, 'text')
     body = ET.SubElement(text, 'body')
 
-    # --- 2. Load and Parse XML ---
+    # --- 3. Load and Parse XML ---
     try:
         tree = ET.parse(input_file)
         root = tree.getroot()
@@ -117,7 +124,7 @@ def xml_to_tbx(input_file, output_file, sl, tl,
         print(f"Error during XML parsing: {e}", file=sys.stderr)
         return
 
-    # --- 3. Normalize Filters ---
+    # --- 4. Normalize Filters ---
     normalized_category_prefixes = normalize_filter_list(category_starts)
     normalized_type_filters = normalize_filter_list(type_filter)
     normalized_jerarquia_filter = normalize_filter_list(hierarchy_filter)
@@ -125,31 +132,30 @@ def xml_to_tbx(input_file, output_file, sl, tl,
     entry_count = 0
     exported_entries = 0
     
-    # --- 4. Iterate and Convert ---
+    # --- 5. Iterate and Convert ---
     
     # Find all <fitxa> elements throughout the tree
     for entry in root.findall('.//fitxa'):
         entry_count += 1
         entry_id = entry.get('num', f'e{entry_count}')
         
-        # 4.1 Extract entry-level fields
+        # 5.1 Extract entry-level fields
         area_tematica = entry.findtext('areatematica', default='').strip()
         
         definitions = {}
-        # Collect definitions only for SL and TL
-        # The prompt only requires the SL definition to be exported, but we collect both for flexibility.
+        # Collect definitions only for the languages in the list
         for definition in entry.findall('definicio'):
             language = definition.get('llengua', '').strip().lower()
             text_content = definition.findtext('.', default='').strip()
-            if text_content and language in [sl, tl]:
+            if text_content and language in normalized_languages:
                 definitions[language] = text_content
         
-        # 4.2 Group all denominations by language and apply filters
-        denominations_by_lang = {sl: [], tl: []}
+        # 5.2 Group all denominations by language and apply filters
+        # Use a list to maintain term order within a language
+        denominations_by_lang = {lang: [] for lang in normalized_languages}
         
-        # Check if the entire fitxa is valid (i.e., if it contains at least one SL term 
-        # that passes ALL filters AND has at least one term in the target language)
-        has_valid_sl_term = False
+        # Flag to check if the entry should be exported (needs at least one term in the target languages)
+        has_valid_term = False
         
         # Pass 1: Collect ALL terms and filter them *individually*
         all_denominations = entry.findall('denominacio')
@@ -163,7 +169,7 @@ def xml_to_tbx(input_file, output_file, sl, tl,
             denomination_type = denomination.get('tipus', '').strip()
             denomination_jerarquia = denomination.get('jerarquia', '').strip()
             
-            if language not in [sl, tl] or not raw_term:
+            if language not in normalized_languages or not raw_term:
                 continue
             
             # Apply all filters to the denomination
@@ -171,10 +177,9 @@ def xml_to_tbx(input_file, output_file, sl, tl,
                                   normalized_category_prefixes, normalized_type_filters, normalized_jerarquia_filter):
                 continue # Skip this denomination if it fails any filter
             
-            # If an SL denomination passes the filters, the entire entry is considered valid for export
-            if language == sl:
-                has_valid_sl_term = True 
-                
+            # If any denomination passes the filters, the entire entry is considered valid for export
+            has_valid_term = True
+            
             # Clean and split terms (e.g., handling variants separated by '|')
             processed_terms = clean_and_split_term(raw_term)
             
@@ -186,11 +191,11 @@ def xml_to_tbx(input_file, output_file, sl, tl,
                     'hierarchy': denomination_jerarquia
                 })
         
-        # Final filter: The entry must contain at least one SL term that passed the filters
-        if not has_valid_sl_term or not denominations_by_lang.get(tl):
+        # Final filter: The entry must contain at least one term that passed the filters
+        if not has_valid_term:
             continue
 
-        # 4.3 Generate TBX <termEntry>
+        # 5.3 Generate TBX <termEntry>
         termEntry = ET.SubElement(body, 'termEntry', attrib={'id': entry_id})
         exported_entries += 1
         
@@ -199,20 +204,26 @@ def xml_to_tbx(input_file, output_file, sl, tl,
             descrip = ET.SubElement(termEntry, 'descrip', attrib={'type': 'subject'})
             descrip.text = area_tematica
         
-        # Process each language (SL first, then TL)
-        for lang_code in [sl, tl]:
+        # Process each language in the requested order (using the normalized_languages set for iteration)
+        # Note: We iterate over the set, so the order is not guaranteed, but TBX does not strictly require it.
+        # If order is crucial, convert the set back to a sorted list based on the input order.
+        for lang_code in normalized_languages:
             
-            # Only proceed if the language has terms OR if it's the SL and we include the definition
-            if denominations_by_lang.get(lang_code) or (include_definition and lang_code == sl and sl in definitions):
+            lang_terms = denominations_by_lang.get(lang_code, [])
+            lang_def = definitions.get(lang_code)
+            
+            # Only proceed if the language has terms OR a definition
+            if lang_terms or (include_definition and lang_def):
                 langSet = ET.SubElement(termEntry, 'langSet', attrib={'xml:lang': lang_code})
 
-                # Add definition (only from SL, as per the help text in the prompt)
-                if include_definition and lang_code == sl and sl in definitions and definitions[sl]:
+                # Add definition 
+                if include_definition and lang_def:
+                    # Using <descrip> for definition in TBX-core 2.0
                     descrip_def = ET.SubElement(langSet, 'descrip', attrib={'type': 'definition'})
-                    descrip_def.text = definitions[sl]
+                    descrip_def.text = lang_def
                 
                 # Add all terms for this language
-                for d in denominations_by_lang.get(lang_code, []):
+                for d in lang_terms:
                     tig = ET.SubElement(langSet, 'tig')
                     
                     term = ET.SubElement(tig, 'term')
@@ -224,20 +235,19 @@ def xml_to_tbx(input_file, output_file, sl, tl,
                         termNote_cat.text = d['category']
 
                     # Type (Term Type)
-                    # NOTE: This is always included if the term passed the filter, but the inclusion flag 
-                    # for <termNote> depends on whether the filter was active. We'll include it only if the filter was used.
-                    if type_filter and d['type']:
+                    # Include if type filter was used OR if it's a non-empty field
+                    if d['type'] and (type_filter or True): # Always include if present, unless explicitly disabled later
                         termNote_type = ET.SubElement(tig, 'termNote', attrib={'type': 'termType'})
                         termNote_type.text = d['type']
 
                     # Hierarchy (Normative Authorization)
-                    # NOTE: Included only if the filter was active.
-                    if hierarchy_filter and d['hierarchy']:
+                    # Include if hierarchy filter was used OR if it's a non-empty field
+                    if d['hierarchy'] and (hierarchy_filter or True):
                         termNote_hier = ET.SubElement(tig, 'termNote', attrib={'type': 'normativeAuthorization'})
                         termNote_hier.text = d['hierarchy']
 
 
-    # --- 5. Finalize and Save TBX ---
+    # --- 6. Finalize and Save TBX ---
     indent(martif)
 
     try:
@@ -251,7 +261,7 @@ def xml_to_tbx(input_file, output_file, sl, tl,
         print(f"An unexpected error occurred during writing: {e}", file=sys.stderr)
         return
 
-    # --- 6. Summary Message ---
+    # --- 7. Summary Message ---
     print("-" * 50)
     print(f"XML entries processed: {entry_count}. TBX entries generated: {exported_entries}.")
     
@@ -263,7 +273,7 @@ def xml_to_tbx(input_file, output_file, sl, tl,
 
 
 # ==============================================================================
-# 3. ARGPARSE CONFIGURATION (All Named Arguments)
+# 3. ARGPARSE CONFIGURATION (MODIFIED for Multilingual List)
 # ==============================================================================
 
 if __name__ == '__main__':
@@ -272,7 +282,7 @@ if __name__ == '__main__':
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    # --- Required Arguments (now using -i/-o and --sl/--tl) ---
+    # --- Required Arguments (Modified for Multilingual) ---
     parser.add_argument(
         '-i', '--input', 
         type=str, 
@@ -285,17 +295,15 @@ if __name__ == '__main__':
         required=True,
         help="Output TBX file path (e.g., 'termbase.tbx')."
     )
+    # MODIFIED: Removed --sl and --tl. Added -l/--languages.
     parser.add_argument(
-        '--sl', 
+        '-l', '--languages', 
+        nargs='+', # Accepts one or more arguments
         type=str, 
         required=True,
-        help="Source language code (e.g., 'ca')."
-    )
-    parser.add_argument(
-        '--tl', 
-        type=str, 
-        required=True,
-        help="Target language code (e.g., 'es')."
+        help=("List of language codes to include (e.g., 'ca es en fr').\n"
+              "The program will only extract denominations and definitions for these languages.\n"
+              "Example usage: -l ca es en")
     )
 
     # --- Optional Inclusion Flags ---
@@ -311,17 +319,17 @@ if __name__ == '__main__':
         '--include-definition', 
         action='store_true', 
         default=False, 
-        help="Include the Definition (from SL) as <descrip type=\"definition\">."
+        help="Include the Definition (for ALL included languages that have one) as <descrip type=\"definition\">."
     )
     inclusion_group.add_argument(
         '--include-category',
         action='store_true', 
         default=False, 
-        help="Include the term's category (<categoria>, e.g., 'n f') as <termNote type=\"partOfSpeech\">. This is *required* to apply the category filter."
+        help="Include the term's category (<categoria>, e.g., 'n f') as <termNote type=\"partOfSpeech\">."
     )
     
     # --- Optional Filter Arguments ---
-    filter_group = parser.add_argument_group('Filtering Options', 'Filters are applied to ALL denominations in the TBX file. Only denominations that satisfy ALL active filters are included.')
+    filter_group = parser.add_argument_group('Filtering Options', 'Filters are applied to ALL denominations in the XML. Only entries containing at least one denomination that satisfies ALL active filters AND is in the target language list are included.')
 
     filter_group.add_argument(
         '--category-starts',
@@ -357,8 +365,7 @@ if __name__ == '__main__':
     xml_to_tbx(
         args.input, 
         args.output, 
-        args.sl.lower(), 
-        args.tl.lower(), 
+        args.languages, # Pass the list of languages
         args.include_area, 
         args.include_definition, 
         args.include_category,
